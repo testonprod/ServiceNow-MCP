@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.azure
+.vscode/
+*.js.map
+*.d.ts
+!src/**/*.d.ts

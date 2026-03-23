@@ -1,0 +1,44 @@
+# Deploy ServiceNow MCP Server to Azure App Service
+# Docs: https://docs.github.com/en/actions/deployment/deploying-to-your-cloud-provider/deploying-to-azure
+#
+# To configure:
+# 1. Create an Azure App Service (Linux, Node 22)
+# 2. Download the Publish Profile from Azure Portal
+# 3. Add it as a GitHub secret named AZURE_WEBAPP_PUBLISH_PROFILE
+# 4. Update the AZURE_WEBAPP_NAME below with your App Service name
+
+name: Deploy to Azure App Service
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AZURE_WEBAPP_NAME: your-app-service-name    # <-- Replace with your App Service name
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .
