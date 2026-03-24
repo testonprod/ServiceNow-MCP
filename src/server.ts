@@ -6,58 +6,38 @@ import { z } from "zod";
 import dotenv from "dotenv";
 dotenv.config();
 
-const server = new McpServer({
-  name: "servicenow-mcp",
-  version: "1.0.0",
-});
+// ========== CONFIG (from env only — no secrets hardcoded) ==========
 
-// ========== AUTH: OAuth (pass-through or server-side) ==========
+const SN_INSTANCE = process.env.SN_INSTANCE;
+const SN_CLIENT_ID = process.env.SN_CLIENT_ID;
 
-// AsyncLocalStorage carries the Bearer token from the Express request into MCP tool handlers
-const tokenStore = new AsyncLocalStorage<string>();
-
-const SN_INSTANCE = process.env.SN_INSTANCE!;
-const SN_CLIENT_ID = process.env.SN_CLIENT_ID!;
-const SN_CLIENT_SECRET = process.env.SN_CLIENT_SECRET!;
-const SN_USERNAME = process.env.SN_USERNAME;
-const SN_PASSWORD = process.env.SN_PASSWORD;
+if (!SN_INSTANCE || !SN_CLIENT_ID) {
+  console.error("❌ Missing required env vars: SN_INSTANCE, SN_CLIENT_ID");
+  process.exit(1);
+}
 
 const SN_BASE = `https://${SN_INSTANCE}.service-now.com`;
 const SN_BASE_URL = `${SN_BASE}/api/now/table/incident`;
 
-// Server-side OAuth token cache
-let cachedToken: { access_token: string; expires_at: number } | null = null;
+// ========== AUTH: Agent must provide Bearer token ==========
 
-async function getServerToken(): Promise<string> {
-  if (cachedToken && Date.now() < cachedToken.expires_at) return cachedToken.access_token;
-  if (!SN_USERNAME || !SN_PASSWORD) throw new Error("No Bearer token provided and SN_USERNAME/SN_PASSWORD not configured for server-side OAuth.");
-  const res = await fetch(`${SN_BASE}/oauth_token.do`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "password",
-      client_id: SN_CLIENT_ID,
-      client_secret: SN_CLIENT_SECRET,
-      username: SN_USERNAME,
-      password: SN_PASSWORD,
-    }),
-  });
-  if (!res.ok) throw new Error(`Failed to obtain server-side OAuth token (HTTP ${res.status}): ${await res.text()}`);
-  const data = await res.json();
-  if (data.error) throw new Error(`OAuth token error: ${data.error_description || data.error}`);
-  cachedToken = { access_token: data.access_token, expires_at: Date.now() + (data.expires_in - 60) * 1000 };
-  return data.access_token;
+// AsyncLocalStorage carries the Bearer token from the Express request into MCP tool handlers
+const tokenStore = new AsyncLocalStorage<string>();
+
+function getAuthHeader(): string {
+  const token = tokenStore.getStore();
+  if (!token) {
+    throw new Error(
+      "No Bearer token provided. The agent must authenticate with ServiceNow OAuth and pass the token in the Authorization header."
+    );
+  }
+  return `Bearer ${token}`;
 }
 
-async function getAuthHeader(): Promise<string> {
-  const clientToken = tokenStore.getStore();
-  if (clientToken) return `Bearer ${clientToken}`;
-  const serverToken = await getServerToken();
-  return `Bearer ${serverToken}`;
-}
+// ========== ServiceNow API helper ==========
 
 async function snRequest(path: string, method: string, body?: Record<string, unknown>) {
-  const auth = await getAuthHeader();
+  const auth = getAuthHeader();
   const res = await fetch(path, {
     method,
     headers: {
@@ -76,7 +56,8 @@ async function snRequest(path: string, method: string, body?: Record<string, unk
   return res.json();
 }
 
-// Resolve the current authenticated user's sys_id and username
+// ========== Identity helpers ==========
+
 async function getCurrentUser(): Promise<{ sys_id: string; user_name: string; name: string; email: string }> {
   const url = `${SN_BASE}/api/now/table/sys_user?sysparm_query=user_name=javascript:gs.getUserName()&sysparm_limit=1&sysparm_fields=sys_id,user_name,name,email`;
   const data = await snRequest(url, "GET");
@@ -94,22 +75,29 @@ async function resolveIncidentSysId(identifier: string): Promise<string> {
   return data.result[0].sys_id;
 }
 
+// ========== MCP Server ==========
+
+const server = new McpServer({
+  name: "servicenow-mcp",
+  version: "1.0.0",
+});
+
 // ========== GET INCIDENTS ==========
 
 server.tool(
   "get-servicenow-incidents",
-  "Search and retrieve ServiceNow incidents. Supports filtering by incident number, assigned user, assignment group, state, priority, category, date range, and keyword search.",
+  "Search and retrieve ServiceNow incidents. Supports filtering by incident number, assigned user, assignment group, state, priority, category, date range, and keyword search. Use this for queries like 'show me INC0010001', 'get P1 incidents from last week', 'open incidents for the network team', 'find incidents about email', etc.",
   {
-    number: z.string().optional().describe("Incident number (e.g. INC0010001) or comma-separated numbers"),
+    number: z.string().optional().describe("Incident number (e.g. INC0010001) or comma-separated numbers (e.g. INC0010001,INC0010002)"),
     assigned_to: z.string().optional().describe("User ID or display name to filter by assigned user"),
     assignment_group: z.string().optional().describe("Assignment group name (e.g. Network, Database, Desktop Support)"),
-    state: z.string().optional().describe("State: 1=New, 2=In Progress, 3=On Hold, 6=Resolved, 7=Closed. Use 'open' for all active"),
+    state: z.string().optional().describe("State: 1=New, 2=In Progress, 3=On Hold, 6=Resolved, 7=Closed. Use 'open' for all active incidents (New, In Progress, On Hold)"),
     priority: z.string().optional().describe("Priority: 1=Critical, 2=High, 3=Moderate, 4=Low, 5=Planning"),
     category: z.string().optional().describe("Category (e.g. software, hardware, network, inquiry)"),
     short_description: z.string().optional().describe("Keyword to search in short description"),
-    created_after: z.string().optional().describe("Show incidents created after this date (YYYY-MM-DD)"),
-    created_before: z.string().optional().describe("Show incidents created before this date (YYYY-MM-DD)"),
-    order_by: z.string().optional().describe("Sort field (prefix with - for descending). Default: -opened_at"),
+    created_after: z.string().optional().describe("Show incidents created after this date (YYYY-MM-DD format)"),
+    created_before: z.string().optional().describe("Show incidents created before this date (YYYY-MM-DD format)"),
+    order_by: z.string().optional().describe("Sort field: opened_at, priority, updated_on. Prefix with - for descending. Default: -opened_at"),
     limit: z.number().optional().describe("Number of incidents to retrieve (default 10, max 100)"),
   },
   async (params) => {
@@ -163,7 +151,7 @@ server.tool(
 
 server.tool(
   "create-servicenow-incident",
-  "Create a new ServiceNow incident.",
+  "Create a new ServiceNow incident. Use this when the user says 'create a ticket', 'log an incident', 'open a new incident', 'raise a ticket for...', etc.",
   {
     short_description: z.string().describe("Brief summary of the incident (required)"),
     description: z.string().optional().describe("Detailed description of the incident"),
@@ -171,7 +159,7 @@ server.tool(
     urgency: z.string().optional().describe("Urgency level (1=High, 2=Medium, 3=Low)"),
     impact: z.string().optional().describe("Impact level (1=High, 2=Medium, 3=Low)"),
     assigned_to: z.string().optional().describe("User ID or name to assign the incident to"),
-    assignment_group: z.string().optional().describe("Assignment group name"),
+    assignment_group: z.string().optional().describe("Assignment group name (e.g. Network, Database, Desktop Support, Service Desk)"),
     category: z.string().optional().describe("Category (e.g. software, hardware, network, inquiry)"),
     subcategory: z.string().optional().describe("Subcategory (e.g. email, OS, DNS, DHCP, vpn)"),
     caller_id: z.string().optional().describe("User ID or name of the caller/requester"),
@@ -196,10 +184,12 @@ server.tool(
     const inc = data.result;
 
     return {
-      content: [{
-        type: "text",
-        text: `Incident created successfully.\nNumber: ${inc.number}\nSys ID: ${inc.sys_id}\nShort Description: ${inc.short_description}`,
-      }],
+      content: [
+        {
+          type: "text",
+          text: `Incident created successfully.\nNumber: ${inc.number}\nSys ID: ${inc.sys_id}\nShort Description: ${inc.short_description}`,
+        },
+      ],
     };
   }
 );
@@ -208,7 +198,7 @@ server.tool(
 
 server.tool(
   "update-servicenow-incident",
-  "Update an existing ServiceNow incident by number or sys_id.",
+  "Update an existing ServiceNow incident by number or sys_id. Use for state changes, reassignments, priority changes, adding notes, resolving, closing, or any field update. Queries: 'change INC0010001 to in progress', 'reassign to network team', 'resolve INC0010001', 'put on hold', 'escalate to P1', etc.",
   {
     identifier: z.string().describe("The incident number (e.g. INC0010001) or sys_id to update"),
     short_description: z.string().optional().describe("Updated short description"),
@@ -218,10 +208,10 @@ server.tool(
     urgency: z.string().optional().describe("Urgency level (1=High, 2=Medium, 3=Low)"),
     impact: z.string().optional().describe("Impact level (1=High, 2=Medium, 3=Low)"),
     assigned_to: z.string().optional().describe("User ID or name to reassign"),
-    assignment_group: z.string().optional().describe("Assignment group name to reassign to"),
-    category: z.string().optional().describe("Updated category"),
-    work_notes: z.string().optional().describe("Internal work notes — visible only to IT staff"),
-    comments: z.string().optional().describe("Customer-visible comments"),
+    assignment_group: z.string().optional().describe("Assignment group name to reassign to (e.g. Network, Database, Desktop Support)"),
+    category: z.string().optional().describe("Updated category (e.g. software, hardware, network)"),
+    work_notes: z.string().optional().describe("Internal work notes — visible only to IT staff, not the caller"),
+    comments: z.string().optional().describe("Customer-visible comments — visible to the caller/requester"),
     hold_reason: z.string().optional().describe("Reason for putting on hold (1=Awaiting Caller, 2=Awaiting Change, 3=Awaiting Problem, 4=Awaiting Vendor)"),
     close_notes: z.string().optional().describe("Notes when resolving or closing the incident"),
     close_code: z.string().optional().describe("Close code (e.g. Solved (Permanently), Closed/Resolved by Caller)"),
@@ -249,10 +239,12 @@ server.tool(
     const inc = data.result;
 
     return {
-      content: [{
-        type: "text",
-        text: `Incident updated successfully.\nNumber: ${inc.number}\nState: ${inc.state}\nShort Description: ${inc.short_description}`,
-      }],
+      content: [
+        {
+          type: "text",
+          text: `Incident updated successfully.\nNumber: ${inc.number}\nState: ${inc.state}\nShort Description: ${inc.short_description}`,
+        },
+      ],
     };
   }
 );
@@ -261,15 +253,21 @@ server.tool(
 
 server.tool(
   "delete-servicenow-incident",
-  "Delete a ServiceNow incident by sys_id or incident number.",
+  "Delete a ServiceNow incident by sys_id or incident number",
   {
     identifier: z.string().describe("The incident number (e.g. INC0010001) or sys_id to delete"),
   },
   async (params) => {
     const sysId = await resolveIncidentSysId(params.identifier);
     await snRequest(`${SN_BASE_URL}/${sysId}`, "DELETE");
+
     return {
-      content: [{ type: "text", text: `Incident ${params.identifier} deleted successfully.` }],
+      content: [
+        {
+          type: "text",
+          text: `Incident ${params.identifier} deleted successfully.`,
+        },
+      ],
     };
   }
 );
@@ -278,7 +276,7 @@ server.tool(
 
 server.tool(
   "get-incident-details",
-  "Get full details of a single ServiceNow incident by number or sys_id.",
+  "Get full details of a single ServiceNow incident by number or sys_id. Use when the user asks 'tell me about INC0010001', 'what's the status of INC0010001', 'show details for INC0010001', 'what happened with that ticket', etc.",
   {
     identifier: z.string().describe("The incident number (e.g. INC0010001) or sys_id"),
   },
@@ -312,7 +310,9 @@ server.tool(
       `Sys ID: ${i.sys_id}`,
     ].join("\n");
 
-    return { content: [{ type: "text", text: details }] };
+    return {
+      content: [{ type: "text", text: details }],
+    };
   }
 );
 
@@ -320,15 +320,15 @@ server.tool(
 
 server.tool(
   "add-work-note",
-  "Add a work note (internal) or customer-visible comment to an incident.",
+  "Add a work note (internal, IT-only) or a customer-visible comment to an incident. Use when the user says 'add a note to INC0010001', 'comment on my ticket', 'post an update', 'leave a work note saying...', etc.",
   {
     identifier: z.string().describe("The incident number (e.g. INC0010001) or sys_id"),
     work_notes: z.string().optional().describe("Internal work notes — visible only to IT staff"),
-    comments: z.string().optional().describe("Customer-visible comment — visible to the caller"),
+    comments: z.string().optional().describe("Customer-visible comment — visible to the caller/requester"),
   },
   async (params) => {
     if (!params.work_notes && !params.comments) {
-      return { content: [{ type: "text", text: "Please provide either work_notes or comments text." }] };
+      return { content: [{ type: "text", text: "Please provide either work_notes (internal) or comments (customer-visible) text." }] };
     }
     const sysId = await resolveIncidentSysId(params.identifier);
     const body: Record<string, unknown> = {};
@@ -351,10 +351,10 @@ server.tool(
 
 server.tool(
   "get-incident-comments",
-  "Retrieve the work notes and comments history for an incident.",
+  "Retrieve the work notes and comments history for an incident. Use when the user asks 'show notes on INC0010001', 'what updates were made', 'show the activity log', 'what comments are on this ticket', etc.",
   {
     identifier: z.string().describe("The incident number (e.g. INC0010001) or sys_id"),
-    type: z.enum(["work_notes", "comments", "all"]).optional().describe("Filter: 'work_notes', 'comments', or 'all' (default: all)"),
+    type: z.enum(["work_notes", "comments", "all"]).optional().describe("Filter by type: 'work_notes' = internal notes, 'comments' = customer-visible, 'all' = both (default: all)"),
     limit: z.number().optional().describe("Max entries to return (default 20)"),
   },
   async (params) => {
@@ -383,7 +383,9 @@ server.tool(
       return `${label} ${e.sys_created_on} by ${e.sys_created_by}\n${e.value}`;
     }).join("\n---\n");
 
-    return { content: [{ type: "text", text: entries }] };
+    return {
+      content: [{ type: "text", text: entries }],
+    };
   }
 );
 
@@ -391,11 +393,11 @@ server.tool(
 
 server.tool(
   "get-my-incidents",
-  "Get incidents raised by or assigned to the currently authenticated user.",
+  "Get incidents raised by or assigned to the currently authenticated user. Use this when the user says 'my tickets', 'my incidents', 'assigned to me', 'raised by me', 'what's on my plate', 'my open P1s', etc.",
   {
-    role: z.enum(["caller", "assigned", "both"]).optional().describe("'caller' = raised by me, 'assigned' = assigned to me, 'both' = either (default: both)"),
-    state: z.string().optional().describe("Filter by state or 'open' for all active"),
-    priority: z.string().optional().describe("Filter by priority (1-5)"),
+    role: z.enum(["caller", "assigned", "both"]).optional().describe("Filter by role: 'caller' = raised by me, 'assigned' = assigned to me, 'both' = either (default: both)"),
+    state: z.string().optional().describe("Filter by state: 1=New, 2=In Progress, 3=On Hold, 6=Resolved, 7=Closed, or 'open' for all active"),
+    priority: z.string().optional().describe("Filter by priority: 1=Critical, 2=High, 3=Moderate, 4=Low, 5=Planning"),
     limit: z.number().optional().describe("Max incidents to return (default 10)"),
   },
   async (params) => {
@@ -432,11 +434,11 @@ server.tool(
   }
 );
 
-// ========== WHO AM I ==========
+// ========== WHO AM I (identity check) ==========
 
 server.tool(
   "whoami",
-  "Returns the currently authenticated ServiceNow user's identity.",
+  "Returns the currently authenticated ServiceNow user's identity. Useful for confirming who is logged in.",
   {},
   async () => {
     const user = await getCurrentUser();
@@ -446,7 +448,7 @@ server.tool(
   }
 );
 
-// ========== EXPRESS SERVER SETUP ==========
+// ========== EXPRESS SERVER ==========
 
 const app = express();
 app.use(express.json());
@@ -459,6 +461,7 @@ const setupServer = async () => {
   await server.connect(transport);
 };
 
+// OAuth discovery — agent uses this to get ServiceNow OAuth URLs and client_id
 app.get("/auth/config", (_req: Request, res: Response) => {
   res.json({
     authorization_url: `${SN_BASE}/oauth_auth.do`,
@@ -470,9 +473,8 @@ app.get("/auth/config", (_req: Request, res: Response) => {
   });
 });
 
+// MCP endpoint — agent MUST send Authorization: Bearer <token>
 app.post("/mcp", async (req: Request, res: Response) => {
-  console.log("Received MCP request");
-
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
 
@@ -493,25 +495,33 @@ app.post("/mcp", async (req: Request, res: Response) => {
 });
 
 app.get("/mcp", (_req: Request, res: Response) => {
-  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null,
+  });
 });
 
 app.delete("/mcp", (_req: Request, res: Response) => {
-  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null,
+  });
 });
 
 app.get("/", (_req: Request, res: Response) => {
-  res.send("ServiceNow MCP Server is running. POST /mcp to interact. GET /auth/config for OAuth setup.");
+  res.send("✅ MCP Server (OAuth) is running. POST /mcp with Bearer token to interact. GET /auth/config for OAuth setup.");
 });
 
 const PORT = process.env.PORT || 3000;
 setupServer()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`ServiceNow MCP Server listening on port ${PORT}`);
+      console.log(`🚀 MCP OAuth Server listening on port ${PORT}`);
     });
   })
   .catch((err) => {
-    console.error("Failed to set up the server:", err);
+    console.error("❌ Failed to set up the server:", err);
     process.exit(1);
   });

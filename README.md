@@ -1,8 +1,8 @@
 # ServiceNow MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects AI agents to **ServiceNow** for incident management. Deploy it to Azure App Service and connect it to **Microsoft Copilot Studio**, **VS Code**, or any MCP-compatible client.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects AI agents to **ServiceNow** for incident management. The agent authenticates via **OAuth 2.0** and passes its Bearer token to the server — **no credentials are stored on the server**.
 
-![Architecture](assets/architecture.png)
+Deploy to Azure App Service and connect to **Microsoft Copilot Studio**, **VS Code**, or any MCP-compatible client.
 
 ## What It Does
 
@@ -24,17 +24,14 @@ This server exposes ServiceNow incident operations as MCP tools that AI agents c
 
 ```
 ┌────────────────────┐         ┌─────────────────────┐         ┌────────────────────┐
-│                    │   MCP   │                     │  REST   │                    │
-│  Copilot Studio /  │ ──────► │  MCP Server         │ ──────► │  ServiceNow        │
-│  VS Code / Client  │ ◄────── │  (Azure App Service)│ ◄────── │  Instance          │
-│                    │         │                     │         │                    │
+│                    │  Bearer  │                     │  REST   │                    │
+│  Agent (Copilot    │  Token   │  MCP Server         │ ──────► │  ServiceNow        │
+│  Studio / VS Code) │ ──────► │  (Azure App Service)│ ◄────── │  Instance          │
+│                    │   MCP   │                     │         │                    │
 └────────────────────┘         └─────────────────────┘         └────────────────────┘
-         Agent                    Express + MCP SDK              OAuth2 + REST API
 ```
 
-**Authentication modes:**
-1. **Pass-through** — The client sends a Bearer token; the server forwards it to ServiceNow.
-2. **Server-side OAuth** — No token from the client; the server acquires one using stored credentials (ideal for multi-agent scenarios in Copilot Studio where tokens don't flow between agents).
+**Authentication:** The agent obtains an OAuth token from ServiceNow and includes it as `Authorization: Bearer <token>` in every MCP request. The server forwards that token to ServiceNow — it never stores credentials or acquires tokens itself.
 
 ---
 
@@ -49,19 +46,19 @@ This server exposes ServiceNow incident operations as MCP tools that AI agents c
 
 ## 1. ServiceNow OAuth Setup
 
-You need an OAuth application in ServiceNow so the MCP server can authenticate.
+Create an OAuth application in ServiceNow so agents can authenticate.
 
 1. Log in to your ServiceNow instance as an admin.
 2. Navigate to **System OAuth → Application Registry**.
 3. Click **New** → **Create an OAuth API endpoint for external clients**.
 4. Fill in:
    - **Name**: `MCP Server` (or any label)
-   - **Redirect URL**: `https://localhost/callback` (not used for password grant, but required)
+   - **Redirect URL**: your agent's OAuth callback URL
    - **Active**: checked
 5. Click **Submit**.
-6. Open the record you just created and note the **Client ID** and **Client Secret**.
+6. Open the record you just created and note the **Client ID**.
 
-> **Important:** The user account you configure must have the `itil` role (or equivalent) to read/write incidents via the REST API.
+> **Important:** The ServiceNow user account the agent authenticates as must have the `itil` role (or equivalent) to read/write incidents via the REST API.
 
 ---
 
@@ -81,17 +78,14 @@ npm install
 cp .env.example .env
 ```
 
-Edit `.env` with your values:
+Edit `.env`:
 
 ```env
 SN_INSTANCE=dev12345
 SN_CLIENT_ID=your-client-id-from-step-above
-SN_CLIENT_SECRET="your-client-secret"
-SN_USERNAME=admin
-SN_PASSWORD="your-password"
 ```
 
-> **Tip:** Wrap values containing special characters (`#`, `!`, etc.) in double quotes.
+That's it — no passwords, no client secrets on the server.
 
 ### Build and run
 
@@ -106,30 +100,33 @@ Or run directly in development mode:
 npm run dev
 ```
 
-The server starts on `http://localhost:3000`. You can verify it's running:
+The server starts on `http://localhost:3000`. Verify:
 
 ```bash
 curl http://localhost:3000/
-# → "ServiceNow MCP Server is running. POST /mcp to interact. GET /auth/config for OAuth setup."
+# → "MCP Server (OAuth) is running. POST /mcp with Bearer token to interact. GET /auth/config for OAuth setup."
 ```
 
 ### Test with a raw MCP request
 
+First, obtain an OAuth token from ServiceNow (your agent does this automatically in production):
+
 ```bash
+TOKEN="your-oauth-bearer-token"
+
 # Initialize the MCP session
 curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# List available tools
+# Call a tool (get P1 incidents)
 curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-
-# Call a tool (get incidents)
-curl -X POST http://localhost:3000/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get-servicenow-incidents","arguments":{"limit":3}}}'
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get-servicenow-incidents","arguments":{"priority":"1","limit":5}}}'
 ```
 
 ---
@@ -139,15 +136,12 @@ curl -X POST http://localhost:3000/mcp \
 ### Option A: Azure Portal (quick)
 
 1. Create a new **App Service** (Linux, Node 22 LTS).
-2. In **Configuration → Application settings**, add these environment variables:
+2. In **Configuration → Application settings**, add:
 
    | Name | Value |
    |------|-------|
    | `SN_INSTANCE` | Your ServiceNow subdomain (e.g. `dev12345`) |
    | `SN_CLIENT_ID` | OAuth Client ID |
-   | `SN_CLIENT_SECRET` | OAuth Client Secret |
-   | `SN_USERNAME` | ServiceNow username |
-   | `SN_PASSWORD` | ServiceNow password |
 
 3. Set up **Deployment Center** → connect your GitHub fork → select `main` branch.
 4. Azure will auto-deploy on push.
@@ -173,24 +167,17 @@ Deploy the container to Azure Container Apps, AWS ECS, or any container host.
 
 ## 4. Connect to Copilot Studio
 
-### Single Agent (Direct MCP)
-
 1. In [Copilot Studio](https://copilotstudio.microsoft.com/), create or open an agent.
 2. Go to **Tools** → **Add a tool** → **Model Context Protocol (MCP)**.
 3. Enter the server URL: `https://your-app-name.azurewebsites.net/mcp`
-4. For authentication, choose one of:
-   - **No authentication** — if your server has `SN_USERNAME`/`SN_PASSWORD` configured (server-side OAuth).
-   - **Bearer token** — if you want to pass an OAuth token from the client.
+4. For authentication, select **OAuth 2.0** and configure:
+   - **Authorization URL**: `https://<instance>.service-now.com/oauth_auth.do`
+   - **Token URL**: `https://<instance>.service-now.com/oauth_token.do`
+   - **Client ID**: your ServiceNow OAuth Client ID
+   - **Scopes**: `useraccount`
 5. Save and test. The agent will see all 9 tools and can call them conversationally.
 
-### Multi-Agent Setup
-
-In Copilot Studio multi-agent scenarios, the parent agent typically does not forward Bearer tokens to child agents. Use **server-side OAuth** (configure `SN_USERNAME`/`SN_PASSWORD` on the App Service) so the MCP server acquires its own token.
-
-1. Create a **child agent** with the MCP connection (as above, no authentication needed).
-2. Create a **parent agent** (e.g., "Help Desk Assistant").
-3. In the parent agent, add the child agent as a connected agent.
-4. The parent delegates ServiceNow tasks to the child, which calls the MCP server.
+> **Tip:** The server exposes `GET /auth/config` which returns the OAuth URLs and Client ID — useful for programmatic agent setup.
 
 ---
 
@@ -254,12 +241,9 @@ ServiceNow-MCP/
 |----------|----------|-------------|
 | `SN_INSTANCE` | Yes | ServiceNow instance subdomain (e.g. `dev12345`) |
 | `SN_CLIENT_ID` | Yes | OAuth2 Client ID from ServiceNow Application Registry |
-| `SN_CLIENT_SECRET` | Yes | OAuth2 Client Secret |
-| `SN_USERNAME` | No* | ServiceNow username for server-side token acquisition |
-| `SN_PASSWORD` | No* | ServiceNow password for server-side token acquisition |
 | `PORT` | No | HTTP port (default: `3000`) |
 
-\* Required if you want **server-side OAuth** (no client token needed). If clients always send their own Bearer tokens, these can be omitted.
+The server does **not** store `SN_CLIENT_SECRET`, `SN_USERNAME`, or `SN_PASSWORD`. The agent handles OAuth authentication and passes the Bearer token per-request.
 
 ---
 
@@ -267,8 +251,8 @@ ServiceNow-MCP/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/mcp` | MCP protocol endpoint (JSON-RPC over HTTP) |
-| `GET` | `/auth/config` | Returns OAuth configuration for client-side flows |
+| `POST` | `/mcp` | MCP protocol endpoint (JSON-RPC over HTTP). Requires `Authorization: Bearer <token>` header. |
+| `GET` | `/auth/config` | Returns OAuth configuration (URLs, Client ID) for agent-side flows |
 | `GET` | `/` | Health check |
 
 ---
@@ -277,10 +261,9 @@ ServiceNow-MCP/
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Missing Bearer token` on tool calls | No token provided and `SN_USERNAME`/`SN_PASSWORD` not set | Set the credentials in App Settings or pass a Bearer token |
-| `401 Unauthorized` from ServiceNow | Invalid credentials or expired token | Verify OAuth credentials; ensure the user has the `itil` role |
+| `No Bearer token provided` on tool calls | Agent didn't send `Authorization` header | Configure OAuth on the agent; ensure it sends `Bearer <token>` |
+| `401 Unauthorized` from ServiceNow | Invalid or expired token | Ensure the agent refreshes tokens; verify the user has the `itil` role |
 | ServiceNow returns HTML instead of JSON | Instance is hibernating (developer instances sleep after inactivity) | Visit your instance URL in a browser to wake it up |
-| `oauth_token.do` fails | Client secret contains special characters | Wrap the value in double quotes in `.env` |
 | Tools not appearing in Copilot Studio | MCP endpoint not reachable | Check your App Service is running and the URL is correct |
 
 ---
