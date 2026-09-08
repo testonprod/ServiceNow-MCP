@@ -223,6 +223,9 @@ Then use GitHub Copilot Chat in Agent mode — it will discover the ServiceNow t
 ServiceNow-MCP/
 ├── src/
 │   └── server.ts          # MCP server — all tools and Express setup
+├── docs/
+│   └── official-servicenow-mcp/
+│       └── README.md      # How ServiceNow's official/native MCP Server works & compares to this repo
 ├── package.json            # Dependencies and scripts
 ├── tsconfig.json           # TypeScript configuration
 ├── Dockerfile              # Multi-stage Docker build
@@ -232,6 +235,10 @@ ServiceNow-MCP/
 │       └── deploy-azure.yml  # GitHub Actions deployment workflow
 └── README.md
 ```
+
+> **Looking for ServiceNow's official/native MCP Server instead of this custom one?** See
+> [`docs/official-servicenow-mcp/README.md`](docs/official-servicenow-mcp/README.md) for how it works,
+> where it's hosted, and what setup is required.
 
 ---
 
